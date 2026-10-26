@@ -53,7 +53,7 @@ while (message := read()) is not None:
         reply([{'uri': JAR_URI, 'range': {'start': {'line': 3, 'character': 6}, 'end': {'line': 3, 'character': 9}}}])
     elif method == 'workspace/executeCommand' and message['params']['command'] == 'decompile':
         assert message['params']['arguments'] == [JAR_URI]
-        reply({'code': 'package com.acme;\nclass Foo { class Inner {} }\n', 'language': 'JAVA'})
+        reply({'code': 'package com.acme;\n\nclass Foo {\n  class Inner {}\n}\n', 'language': 'JAVA'})
     elif method == 'textDocument/didOpen':
         opened.append(message['params']['textDocument']['uri'])
     elif method == 'test/opened':
