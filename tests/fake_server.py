@@ -39,7 +39,8 @@ while (message := read()) is not None:
     reply = lambda result: send({'jsonrpc': '2.0', 'id': message['id'], 'result': result})
     if method == 'initialize':
         reply({
-            'capabilities': {},
+            # Neovim only sends didOpen to servers that ask for document sync.
+            'capabilities': {'textDocumentSync': 1},
             'test': {
                 'argv': sys.argv[1:],
                 'cwd': os.getcwd(),
