@@ -55,6 +55,16 @@ while (message := read()) is not None:
     elif method == 'workspace/executeCommand' and message['params']['command'] == 'decompile':
         assert message['params']['arguments'] == [JAR_URI]
         reply({'code': 'package com.acme;\n\nclass Foo {\n  class Inner {}\n}\n', 'language': 'JAVA'})
+    elif method == 'workspace/executeCommand' and message['params']['command'] == 'test.applyEdit':
+        # Labelled like IntelliJ's own edits.
+        uri = message['params']['arguments'][0]
+        send({'jsonrpc': '2.0', 'id': 'edit-1', 'method': 'workspace/applyEdit', 'params': {
+            'label': f'Update {uri}',
+            'edit': {'changes': {uri: [{'range': {'start': {'line': 0, 'character': 0},
+                                                  'end': {'line': 0, 'character': 0}},
+                                        'newText': '// edited\n'}]}},
+        }})
+        reply(None)
     elif method == 'textDocument/didOpen':
         opened.append(message['params']['textDocument']['uri'])
     elif method == 'test/opened':

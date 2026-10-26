@@ -54,6 +54,24 @@ if not vim.list_contains(opened, 'jar:file:///libs/acme-1.0.jar!/com/acme/Foo$In
   fail('the server saw these documents open: ' .. vim.inspect(opened))
 end
 
+-- IntelliJ labels every edit; printing the label would stop each quick-fix at a hit-enter prompt.
+local printed = {}
+_G.print = function(...)
+  table.insert(printed, table.concat(vim.tbl_map(tostring, { ... }), ' '))
+end
+client:request('workspace/executeCommand', {
+  command = 'test.applyEdit',
+  arguments = { vim.uri_from_bufnr(main) },
+}, nil, main)
+wait_for('the edit to apply', function()
+  return vim.api.nvim_buf_get_lines(main, 0, 1, false)[1] == '// edited'
+end)
+for _, line in ipairs(printed) do
+  if line:find('Workspace edit', 1, true) then
+    fail('the edit label was printed: ' .. line)
+  end
+end
+
 client:stop()
 wait_for('the client to stop', function() return client:is_stopped() end)
 os.exit(0)

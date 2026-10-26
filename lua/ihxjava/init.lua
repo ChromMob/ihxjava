@@ -48,6 +48,16 @@ function M.setup(config)
       end
     end,
     init_options = {},
+    handlers = {
+      -- IntelliJ labels every edit "Update file:///<full path>". Neovim prints that label, and a
+      -- long path stops each quick-fix at a hit-enter prompt.
+      ['workspace/applyEdit'] = function(err, params, ctx)
+        if params then
+          params.label = nil
+        end
+        return vim.lsp.handlers['workspace/applyEdit'](err, params, ctx)
+      end,
+    },
   }, config or {}))
   vim.lsp.enable('intellij')
 end
