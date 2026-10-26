@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bridge:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.10', '3.x']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover tests -v
+
+  neovim:
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: [v0.11.0, stable]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Neovim ${{ matrix.nvim }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/nvim"
+          curl -sSfL "https://github.com/neovim/neovim/releases/download/${{ matrix.nvim }}/nvim-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/nvim" --strip-components=1
+          echo "NVIM_BIN=$RUNNER_TEMP/nvim/bin/nvim" >> "$GITHUB_ENV"
+      - run: python -m unittest discover tests -v

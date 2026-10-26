@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""Run JetBrains' official IntelliJ language server (Java and Kotlin) in Helix or Neovim.
+
+Nothing from JetBrains is bundled with this tool. `install` fetches the official
+"Java and Kotlin by IntelliJ IDEA" VS Code extension from Open VSX, reads the server
+bundle it pins (`server-bundle.json`), and downloads that bundle from
+download.jetbrains.com, verifying both checksums. The official launcher is then run
+unmodified. `lsp`, the command the editor starts, is a thin stdio bridge that does the
+parts the VS Code client normally does: passing the accepted-EULA hash and consent
+settings, choosing a per-workspace index directory, filling in initialization
+options, and turning `jar:`/`jrt:` locations (library and JDK classes) into
+decompiled files that the editor can open.
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+NAME = 'ihxjava'
+VERSION = '0.1.0'
+
+OPEN_VSX = 'https://open-vsx.org/api/JetBrains/intellij-server'
+BUNDLE_HOST = 'download.jetbrains.com'
+REGIONS = ['africa', 'americas', 'apac', 'china', 'europe', 'middle_east', 'oceania']
+REGION_LABELS = {
+    'africa': 'Africa',
+    'americas': 'Americas',
+    'apac': 'Asia (except Mainland China)',
+    'china': 'Mainland China',
+    'europe': 'Europe',
+    'middle_east': 'Middle East',
+    'oceania': 'Oceania',
+}
+DATA_SHARING = ['none', 'anonymous', 'full']
+DATA_SHARING_LABELS = {
+    'none': 'Do not send usage statistics or error reports',
+    'anonymous': 'Anonymous usage statistics and anonymized error reports',
+    'full': 'Anonymous usage statistics and full error reports',
+}
+
+
+def xdg_dir(var, fallback):
+    base = os.environ.get(var)
+    base = Path(base) if base and os.path.isabs(base) else Path.home() / fallback
+    return base / NAME
+
+
+DATA_DIR = xdg_dir('XDG_DATA_HOME', '.local/share')
+CONFIG_DIR = xdg_dir('XDG_CONFIG_HOME', '.config')
+CACHE_DIR = xdg_dir('XDG_CACHE_HOME', '.cache')
+CONFIG_FILE = CONFIG_DIR / 'config.json'
+INSTALL_FILE = DATA_DIR / 'installed.json'
+SERVERS_DIR = DATA_DIR / 'server'
+SYSTEM_DIR = CACHE_DIR / 'system'
+DECOMPILED_DIR = CACHE_DIR / 'decompiled'
+VERBOSE = os.environ.get('IHXJAVA_VERBOSE', '') not in ('', '0')
+
+# What the launcher prints on every start; editors show each stderr line as an error.
+LAUNCHER_NOISE = re.compile(rb'^(IJ_JAVA_OPTIONS=|idea\.(config|system)\.path=|Log file: )')
+
+HELIX_SNIPPET = '''\
+[language-server.intellij]
+command = "ihxjava"
+args = ["lsp"]
+# Importing and indexing a project can take a while on first start.
+timeout = 120
+
+# Sent to the server as initializationOptions. All keys are optional.
+[language-server.intellij.config]
+# buildTool = "gradle"         # gradle | maven | bazel | jps; "" disables project import
+# defaultSdk = "/usr/lib/jvm/java-21-openjdk"
+
+[[language]]
+name = "java"
+language-servers = ["intellij"]
+
+[[language]]
+name = "kotlin"
+language-servers = ["intellij"]
+'''
+
+
+def log(*parts):
+    print(f'{NAME}:', *parts, file=sys.stderr, flush=True)
+
+
+def die(message):
+    log(message)
+    sys.exit(1)
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(value, indent=2) + '\n')
+    tmp.replace(path)
+
+
+def load_config():
+    config = load_json(CONFIG_FILE, {})
+    return config if isinstance(config, dict) else {}
+
+
+def load_install():
+    install = load_json(INSTALL_FILE, None)
+    if not isinstance(install, dict) or not Path(install.get('launcher', '')).is_file():
+        return None
+    return install
+
+
+def eula_hash(eula_path):
+    # Same recipe as the VS Code extension: the first 16 hex digits of the EULA's sha256.
+    return hashlib.sha256(Path(eula_path).read_bytes()).hexdigest()[:16]
+
+
+def readiness_problem(install, config):
+    """Why the server can't start yet, or None. Phrased for someone reading the editor's log."""
+    if install is None:
+        return f'the IntelliJ language server is not installed; run `{NAME} install`'
+    if config.get('eulaAccepted') != eula_hash(install['eula']):
+        return f'the JetBrains User Agreement has not been accepted; run `{NAME} setup`'
+    if config.get('region') not in REGIONS:
+        return f'no region is selected; run `{NAME} setup`'
+    if config.get('dataSharing', 'none') not in DATA_SHARING:
+        return f'`dataSharing` in {CONFIG_FILE} must be one of {", ".join(DATA_SHARING)}'
+    return None
+
+
+def system_path(install, root):
+    """The server's caches and indexes for one workspace."""
+    digest = hashlib.sha256(str(root).encode()).hexdigest()[:16]
+    return SYSTEM_DIR / install['serverVersion'] / digest
+
+
+def shell_quote_if_needed(arg):
+    if re.fullmatch(r'[a-zA-Z0-9._=:/@-]+', arg):
+        return arg
+    return '"' + re.sub(r'(["\\$`])', r'\\\1', arg) + '"'
+
+
+def server_env(config, install):
+    env = dict(os.environ)
+    # The launcher's debug log goes to stdout, which is the protocol channel in --stdio mode.
+    env.pop('IJ_LAUNCHER_DEBUG', None)
+    env.pop('INTELLIJ_DATA_SHARING', None)
+    env.pop('INTELLIJ_REGION', None)
+    data_sharing = config.get('dataSharing', 'none')
+    if data_sharing != 'none':
+        env['INTELLIJ_DATA_SHARING'] = data_sharing
+    if config.get('region') in REGIONS:
+        env['INTELLIJ_REGION'] = config['region']
+    jvm_args = config.get('jvmArgs') or []
+    if jvm_args:
+        extra = ' '.join(shell_quote_if_needed(str(a)) for a in jvm_args)
+        current = env.get('IJ_JAVA_OPTIONS', '')
+        env['IJ_JAVA_OPTIONS'] = f'{current} {extra}' if current else extra
+    if install is not None and config.get('eulaAccepted') == eula_hash(install['eula']):
+        env['INTELLIJ_SERVER_EULA'] = config['eulaAccepted']
+    return env
+
+
+# ---------------------------------------------------------------------------------------------
+# install / update / uninstall
+
+
+def vsix_target():
+    system = {'Linux': 'linux', 'Darwin': 'darwin'}.get(platform.system())
+    arch = {'x86_64': 'x64', 'amd64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(
+        platform.machine().lower()
+    )
+    if system is None or arch is None:
+        die(f'unsupported platform: {platform.system()} {platform.machine()}')
+    return f'{system}-{arch}'
+
+
+def http_get(url):
+    request = urllib.request.Request(url, headers={'User-Agent': f'{NAME}/{VERSION}'})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def download(url, dest, expected_sha256):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + '.part')
+    request = urllib.request.Request(url, headers={'User-Agent': f'{NAME}/{VERSION}'})
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(request, timeout=60) as response, open(part, 'wb') as out:
+        total = int(response.headers.get('Content-Length') or 0)
+        done = 0
+        while chunk := response.read(1 << 20):
+            out.write(chunk)
+            digest.update(chunk)
+            done += len(chunk)
+            if total and sys.stderr.isatty():
+                print(f'\r  {done >> 20} / {total >> 20} MiB', end='', file=sys.stderr, flush=True)
+    if total and sys.stderr.isatty():
+        print(file=sys.stderr)
+    if digest.hexdigest() != expected_sha256.lower():
+        part.unlink(missing_ok=True)
+        die(f'checksum mismatch for {url}')
+    part.replace(dest)
+
+
+def extract(archive, dest_parent):
+    tmp = Path(tempfile.mkdtemp(dir=dest_parent, prefix='.extract-'))
+    with tarfile.open(archive) as tar:
+        try:
+            tar.extractall(tmp, filter='data')
+        except tarfile.FilterError:
+            # The archive is checksum-verified; 'tar' still refuses paths outside the target.
+            shutil.rmtree(tmp)
+            tmp.mkdir()
+            tar.extractall(tmp, filter='tar')
+    launchers = sorted(tmp.glob('**/bin/intellij-server'), key=lambda p: len(p.parts))
+    if not launchers:
+        shutil.rmtree(tmp)
+        die('the downloaded server bundle has no bin/intellij-server launcher')
+    return tmp, launchers[0].parent.parent
+
+
+def cmd_install(args):
+    target = vsix_target()
+    log(f'looking up the official extension for {target} on Open VSX')
+    meta = json.loads(http_get(f'{OPEN_VSX}/{target}/{args.extension_version or "latest"}'))
+    files = meta['files']
+    vsix_sha = http_get(files['sha256']).decode().split()[0]
+    log(f'downloading extension {meta["version"]}')
+    vsix = http_get(files['download'])
+    if hashlib.sha256(vsix).hexdigest() != vsix_sha.lower():
+        die('extension checksum mismatch')
+    with zipfile.ZipFile(io.BytesIO(vsix)) as z:
+        bundle = json.loads(z.read('extension/server-bundle.json'))
+
+    url = urllib.parse.urlsplit(bundle['url'])
+    if url.scheme != 'https' or url.hostname != BUNDLE_HOST:
+        die(f'refusing to download the server from an unexpected location: {bundle["url"]}')
+
+    current = load_install()
+    if current and current.get('serverVersion') == bundle['version'] and not args.force:
+        log(f'server {bundle["version"]} is already installed (use --force to reinstall)')
+        return
+
+    SERVERS_DIR.mkdir(parents=True, exist_ok=True)
+    archive = DATA_DIR / 'downloads' / bundle['archiveName']
+    log(f'downloading IntelliJ server {bundle["version"]} from {BUNDLE_HOST}')
+    download(bundle['url'], archive, bundle['sha256'])
+    log('extracting')
+    tmp, root = extract(archive, SERVERS_DIR)
+    dest = SERVERS_DIR / bundle['version']
+    if dest.exists():
+        shutil.rmtree(dest)
+    root.rename(dest)
+    shutil.rmtree(tmp, ignore_errors=True)
+    archive.unlink(missing_ok=True)
+
+    launcher = dest / 'bin' / 'intellij-server'
+    install = {
+        'serverVersion': bundle['version'],
+        'extensionVersion': meta['version'],
+        'target': target,
+        'serverDir': str(dest),
+        'launcher': str(launcher),
+        'eula': str(dest / 'EULA.txt'),
+    }
+    save_json(INSTALL_FILE, install)
+    if not args.keep_old:
+        for old in SERVERS_DIR.iterdir():
+            if old != dest and old.is_dir() and not old.name.startswith('.'):
+                shutil.rmtree(old, ignore_errors=True)
+    log(f'installed server {bundle["version"]} in {dest}')
+
+    problem = readiness_problem(install, load_config())
+    if problem:
+        log(f'next: {problem}')
+
+
+def cmd_uninstall(args):
+    for path in [DATA_DIR] + ([CACHE_DIR] if args.all else []):
+        if path.exists():
+            shutil.rmtree(path)
+            log(f'removed {path}')
+    if args.all and CONFIG_DIR.exists():
+        shutil.rmtree(CONFIG_DIR)
+        log(f'removed {CONFIG_DIR}')
+
+
+# ---------------------------------------------------------------------------------------------
+# setup / license / doctor / clean
+
+
+def show_text(text):
+    pager = shlex.split(os.environ.get('PAGER') or 'less')
+    try:
+        subprocess.run(pager, input=text, check=False)
+    except OSError:
+        sys.stdout.write(text.decode(errors='replace'))
+
+
+def choose(prompt, options, labels, current):
+    print(prompt)
+    for i, option in enumerate(options, 1):
+        marker = ' (current)' if option == current else ''
+        print(f'  {i}. {labels[option]}{marker}')
+    while True:
+        answer = input(f'Choose 1-{len(options)}' + (' [keep current]: ' if current else ': ')).strip()
+        if not answer and current:
+            return current
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return options[int(answer) - 1]
+        if answer in options:
+            return answer
+
+
+def cmd_setup(args):
+    install = load_install()
+    if install is None:
+        die(f'install the server first: `{NAME} install`')
+    config = load_config()
+    interactive = sys.stdin.isatty()
+    expected = eula_hash(install['eula'])
+
+    if config.get('eulaAccepted') != expected:
+        if not args.accept_eula:
+            if not interactive:
+                die('pass --accept-eula to accept the JetBrains User Agreement non-interactively')
+            show_text(Path(install['eula']).read_bytes())
+            answer = input('Type "accept" to accept the JetBrains User Agreement shown above: ')
+            if answer.strip().lower() != 'accept':
+                die('the agreement was not accepted; nothing was changed')
+        config['eulaAccepted'] = expected
+    else:
+        print('JetBrains User Agreement: accepted')
+
+    if args.region:
+        config['region'] = args.region
+    elif args.reconfigure or config.get('region') not in REGIONS:
+        if not interactive:
+            die('pass --region to choose a region non-interactively')
+        config['region'] = choose(
+            'Region used for JetBrains product terms and data processing:',
+            REGIONS, REGION_LABELS, config.get('region'),
+        )
+
+    if args.data_sharing:
+        config['dataSharing'] = args.data_sharing
+    elif args.reconfigure or config.get('dataSharing') not in DATA_SHARING:
+        if interactive:
+            config['dataSharing'] = choose(
+                'Diagnostic data shared with JetBrains:',
+                DATA_SHARING, DATA_SHARING_LABELS, config.get('dataSharing'),
+            )
+        else:
+            config['dataSharing'] = 'none'
+
+    save_json(CONFIG_FILE, config)
+    print(f'Saved {CONFIG_FILE}')
+    print(
+        'The server needs an IntelliJ IDEA Ultimate (or All Products Pack) license or trial.\n'
+        f'Check it with `{NAME} license status`, then if needed:\n'
+        f'  {NAME} license login                 sign in with a JetBrains Account\n'
+        f'  {NAME} license activate <code|file|url>\n'
+        f'  {NAME} license trial                 start a trial'
+    )
+
+
+def cmd_license(args):
+    install = load_install()
+    if install is None:
+        die(f'install the server first: `{NAME} install`')
+    rest = args.rest[1:] if args.rest[:1] == ['--'] else args.rest
+    command = [install['launcher'], 'license', *rest]
+    return subprocess.run(command, env=server_env(load_config(), install)).returncode
+
+
+def dir_size(path):
+    return sum(f.stat().st_size for f in path.rglob('*') if f.is_file()) if path.exists() else 0
+
+
+def cmd_doctor(args):
+    install = load_install()
+    config = load_config()
+    print(f'{NAME} {VERSION}')
+    if install:
+        print(f'server:     {install["serverVersion"]} (from extension {install["extensionVersion"]}, {install["target"]})')
+        print(f'launcher:   {install["launcher"]}')
+    else:
+        print('server:     not installed')
+    print(f'config:     {CONFIG_FILE}')
+    print(f'region:     {config.get("region", "not set")}')
+    print(f'data:       {config.get("dataSharing", "none")}')
+    print(f'caches:     {SYSTEM_DIR} ({dir_size(SYSTEM_DIR) >> 20} MiB)')
+    found = shutil.which(NAME)
+    print(f'on PATH:    {found or "no - editors will not find it"}')
+    problem = readiness_problem(install, config)
+    print(f'status:     {"ready" if problem is None else problem}')
+    if install:
+        print('\nLicense:')
+        sys.stdout.flush()
+        subprocess.run([install['launcher'], 'license', 'status'], env=server_env(config, install))
+    print(f'\nIn Helix, `hx --health java` should list "intellij" with the {NAME} command;')
+    print('in Neovim, `:checkhealth vim.lsp` should list an "intellij" client in a Java file.')
+
+
+def cmd_logs(args):
+    install = load_install()
+    if install is None:
+        die(f'the server is not installed; run `{NAME} install`')
+    root = Path(args.project or os.getcwd()).resolve()
+    log_file = system_path(install, root) / 'system' / 'log' / 'intellij-server.log'
+    if not log_file.exists():
+        die(f'no server log for {root} yet (expected {log_file})')
+    print(log_file)
+
+
+def cmd_clean(args):
+    for path in (SYSTEM_DIR, DECOMPILED_DIR):
+        if path.exists():
+            for f in path.rglob('*'):
+                if f.is_file():
+                    f.chmod(0o644)
+            shutil.rmtree(path)
+            log(f'removed {path}')
+
+
+def cmd_helix_config(args):
+    sys.stdout.write(HELIX_SNIPPET)
+
+
+# ---------------------------------------------------------------------------------------------
+# lsp: the bridge the editor runs
+
+
+def read_message(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        key, _, value = line.decode('ascii').partition(':')
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers['content-length'])
+    body = stream.read(length)
+    if len(body) < length:
+        return None
+    return json.loads(body)
+
+
+def write_message(stream, lock, message):
+    body = json.dumps(message, ensure_ascii=False, separators=(',', ':')).encode()
+    with lock:
+        stream.write(b'Content-Length: %d\r\n\r\n' % len(body) + body)
+        stream.flush()
+
+
+def walk(value, fn, key=None):
+    """Rebuilds a JSON value, passing every string with its enclosing key through fn."""
+    if isinstance(value, dict):
+        return {k: walk(v, fn, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [walk(v, fn, key) for v in value]
+    if isinstance(value, str):
+        return fn(key, value)
+    return value
+
+
+def is_archive_uri(key, value):
+    return key in ('uri', 'targetUri') and value.startswith(('jar:', 'jrt:'))
+
+
+def file_uri_path(uri):
+    parts = urllib.parse.urlsplit(uri)
+    if parts.scheme != 'file':
+        return None
+    return os.path.normpath(urllib.parse.unquote(parts.path))
+
+
+def workspace_root(params):
+    uri = params.get('rootUri')
+    if not uri and params.get('workspaceFolders'):
+        uri = params['workspaceFolders'][0].get('uri')
+    path = (file_uri_path(uri) if uri else None) or params.get('rootPath') or os.getcwd()
+    return Path(path).resolve(), uri or Path(path).resolve().as_uri()
+
+
+def initialization_options(user, root_uri):
+    """The server decodes these as one object and drops all of them if any value is ill-typed."""
+    options = {
+        'buildTools': {},
+        'projects': [],
+        'disableRocksDBWriteAheadLog': False,
+        # Code actions carry a command and are computed only when one is chosen; Helix and Neovim
+        # both run such commands.
+        'lazyIntentions': True,
+    }
+    user = dict(user) if isinstance(user, dict) else {}
+    build_tool = user.pop('buildTool', None)
+    if isinstance(build_tool, str):
+        options['buildTools'] = {root_uri: build_tool}
+    options.update(user)
+    return options
+
+
+INTERNAL_ID = f'{NAME}-'
+
+
+class Bridge:
+    def __init__(self, install, config):
+        self.install = install
+        self.config = config
+        self.client_in = sys.stdin.buffer
+        self.client_out = sys.stdout.buffer
+        self.client_lock = threading.Lock()
+        self.server_lock = threading.Lock()
+        self.pending = {}
+        self.pending_lock = threading.Lock()
+        self.next_id = 0
+        self.archive_to_file = {}
+        self.path_to_archive = {}
+        self.map_lock = threading.Lock()
+        self.proc = None
+
+    def send_client(self, message):
+        write_message(self.client_out, self.client_lock, message)
+
+    def send_server(self, message):
+        write_message(self.proc.stdin, self.server_lock, message)
+
+    def run(self):
+        init = read_message(self.client_in)
+        if init is None:
+            return 0
+        if init.get('method') != 'initialize':
+            die(f'expected initialize, got {init.get("method")}')
+        problem = readiness_problem(self.install, self.config)
+        if problem:
+            log(problem)
+            self.send_client({
+                'jsonrpc': '2.0',
+                'id': init['id'],
+                'error': {'code': -32603, 'message': f'{NAME}: {problem}'},
+            })
+            return 1
+
+        params = init.setdefault('params', {})
+        root, root_uri = workspace_root(params)
+        params['initializationOptions'] = initialization_options(
+            params.get('initializationOptions'), root_uri
+        )
+        command = [
+            self.install['launcher'], '--stdio',
+            '--eula', self.config['eulaAccepted'],
+            '--system-path', str(system_path(self.install, root)),
+        ]
+        if VERBOSE:
+            log(f'starting {shlex.join(command)} for {root}')
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=server_env(self.config, self.install), cwd=root,
+        )
+        self.stderr_pump = threading.Thread(target=self.pump_stderr, daemon=True)
+        self.stderr_pump.start()
+        self.send_server(init)
+        threading.Thread(target=self.pump_server, daemon=True).start()
+
+        while (message := read_message(self.client_in)) is not None:
+            try:
+                self.send_server(self.to_server(message))
+            except (BrokenPipeError, ValueError):
+                break
+        # The editor went away without `exit`; give the server a moment to notice the closed pipe.
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            return self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            return self.proc.wait()
+        finally:
+            self.stderr_pump.join(timeout=2)
+
+    def pump_server(self):
+        try:
+            while (message := read_message(self.proc.stdout)) is not None:
+                self.from_server(message)
+        finally:
+            code = self.proc.wait()
+            # A crashing server's last words are the ones worth keeping.
+            self.stderr_pump.join(timeout=2)
+            try:
+                self.client_out.flush()
+            finally:
+                os._exit(code)
+
+    def pump_stderr(self):
+        # Everything except the launcher's start-up chatter reaches the editor's log, so crashes still show.
+        for line in self.proc.stderr:
+            if VERBOSE or not LAUNCHER_NOISE.match(line):
+                sys.stderr.buffer.write(line)
+                sys.stderr.buffer.flush()
+
+    def from_server(self, message):
+        message_id = message.get('id')
+        if isinstance(message_id, str) and message_id.startswith(INTERNAL_ID) and 'method' not in message:
+            with self.pending_lock:
+                slot = self.pending.pop(message_id, None)
+            if slot is not None:
+                slot['response'] = message
+                slot['event'].set()
+            return
+        archives = set()
+        walk(message, lambda k, v: archives.add(v) if is_archive_uri(k, v) else None)
+        if not archives:
+            self.send_client(message)
+        elif 'id' in message:
+            # Decompiling needs a round trip through this reader, so it can't happen here.
+            threading.Thread(
+                target=self.forward_decompiled, args=(message, archives), daemon=True
+            ).start()
+        else:
+            # Keep notifications in order; only locations decompiled already are rewritten.
+            self.send_client(self.rewrite_archives(message))
+
+    def forward_decompiled(self, message, archives):
+        for uri in archives:
+            with self.map_lock:
+                known = uri in self.archive_to_file
+            if not known:
+                self.decompile(uri)
+        self.send_client(self.rewrite_archives(message))
+
+    def rewrite_archives(self, message):
+        with self.map_lock:
+            mapping = dict(self.archive_to_file)
+        return walk(message, lambda k, v: mapping.get(v, v) if is_archive_uri(k, v) else v)
+
+    def to_server(self, message):
+        with self.map_lock:
+            if not self.path_to_archive:
+                return message
+            mapping = dict(self.path_to_archive)
+
+        def back(_key, value):
+            if value.startswith('file:'):
+                return mapping.get(file_uri_path(value), value)
+            return value
+
+        return walk(message, back)
+
+    def request_server(self, method, params, timeout):
+        with self.pending_lock:
+            self.next_id += 1
+            request_id = f'{INTERNAL_ID}{self.next_id}'
+            slot = {'event': threading.Event()}
+            self.pending[request_id] = slot
+        self.send_server({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
+        if not slot['event'].wait(timeout):
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+            return None
+        return slot.get('response')
+
+    def decompile(self, uri):
+        # The same server command the VS Code extension's jar:/jrt: content provider calls.
+        response = self.request_server(
+            'workspace/executeCommand', {'command': 'decompile', 'arguments': [uri]}, timeout=60
+        )
+        result = (response or {}).get('result')
+        if not isinstance(result, dict) or not isinstance(result.get('code'), str):
+            log(f'could not decompile {uri}: {(response or {}).get("error", "no result")}')
+            return
+        path = decompiled_path(uri, result.get('language'))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.chmod(0o644)
+        path.write_text(result['code'])
+        # Read-only, so the editor warns before anyone edits a decompiled class.
+        path.chmod(0o444)
+        with self.map_lock:
+            self.archive_to_file[uri] = path.as_uri()
+            self.path_to_archive[os.path.normpath(str(path))] = uri
+
+
+def decompiled_path(uri, language):
+    inner = uri.split('!', 1)[1] if '!' in uri else urllib.parse.urlsplit(uri).path
+    name = urllib.parse.unquote(inner).rstrip('/').rsplit('/', 1)[-1]
+    stem = re.sub(r'[^A-Za-z0-9_.-]', '_', name.rsplit('.', 1)[0]) or 'Decompiled'
+    extension = '.kt' if 'kotlin' in str(language or '').lower() else '.java'
+    digest = hashlib.sha256(uri.encode()).hexdigest()[:12]
+    return DECOMPILED_DIR / digest / (stem + extension)
+
+
+def cmd_lsp(args):
+    return Bridge(load_install(), load_config()).run()
+
+
+# ---------------------------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=NAME, description="Use JetBrains' official IntelliJ language server from Helix or Neovim."
+    )
+    parser.add_argument('--version', action='version', version=f'{NAME} {VERSION}')
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    p = sub.add_parser('install', help='download the official server (also updates it)')
+    p.add_argument('--force', action='store_true', help='reinstall even if up to date')
+    p.add_argument('--keep-old', action='store_true', help='keep previously installed servers')
+    p.add_argument('--extension-version', help='take the server pinned by this extension version')
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser('setup', help='accept the EULA and choose region and data sharing')
+    p.add_argument('--accept-eula', action='store_true', help='accept the bundled JetBrains User Agreement')
+    p.add_argument('--region', choices=REGIONS)
+    p.add_argument('--data-sharing', choices=DATA_SHARING)
+    p.add_argument('--reconfigure', action='store_true', help='ask again for region and data sharing')
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser('license', help="run the server's license command (status, login, activate, trial, reset)")
+    p.add_argument('rest', nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_license)
+
+    p = sub.add_parser('lsp', help='run the language server over stdio (what the editor starts)')
+    p.set_defaults(func=cmd_lsp)
+
+    p = sub.add_parser('doctor', help='show the installation, settings and license state')
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser('logs', help="print the path of a project's server log")
+    p.add_argument('project', nargs='?', help='project root (default: current directory)')
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser('clean', help='delete indexes and decompiled classes (quit editors first)')
+    p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser('helix-config', help='print a languages.toml snippet')
+    p.set_defaults(func=cmd_helix_config)
+
+    p = sub.add_parser('uninstall', help='remove the downloaded server')
+    p.add_argument('--all', action='store_true', help='also remove caches and settings')
+    p.set_defaults(func=cmd_uninstall)
+
+    args = parser.parse_args()
+    try:
+        sys.exit(args.func(args) or 0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == '__main__':
+    main()
